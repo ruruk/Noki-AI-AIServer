@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     port: int = 8000
     
     # OpenAI Configuration
-    openai_api_key: Optional[str] = None
+    openai_api_key: str = ""
     openai_model: str = "gpt-4o"
     openai_temperature: float = 0.7
     openai_max_tokens: int = 2000

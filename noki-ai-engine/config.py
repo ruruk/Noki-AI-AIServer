@@ -24,11 +24,13 @@ class Settings(BaseSettings):
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Validate required environment variables
-        if not self.openai_api_key:
-            raise ValueError(
-                "OPENAI_API_KEY is required but not set. "
-                "Please set it in your .env file or as an environment variable."
+        # Validate required environment variables only if not in Railway deployment
+        # Railway sets env vars after container starts
+        if not self.openai_api_key and not os.getenv("RAILWAY_ENVIRONMENT"):
+            import warnings
+            warnings.warn(
+                "OPENAI_API_KEY is not set. "
+                "AI features will not work until this is configured."
             )
     
     # Pinecone Vector Database Configuration
