@@ -55,8 +55,11 @@ class ChatInput(BaseModel):
     prompt: str
     projects: Optional[List[Project]] = None
     tasks: Optional[List[Task]] = None
+    todos: Optional[List[Any]] = None  # Todo items
     stage: Stage = Stage.THINKING
     metadata: Optional[Dict[str, Any]] = None
+    conversation_history: Optional[List[Dict[str, Any]]] = None
+    auth_token: Optional[str] = None  # JWT token for backend calls
 
 
 class AIIntent(BaseModel):

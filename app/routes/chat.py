@@ -70,8 +70,8 @@ async def chat(
     try:
         logger.info(f"Processing chat request for user {chat_input.user_id}, conversation {chat_input.conversation_id}")
         
-        # Process the chat request
-        response = llm_service.process_chat_request(chat_input)
+        # Process the chat request (now async)
+        response = await llm_service.process_chat_request(chat_input)
         
         # If we have an intent, enhance the response with planner service
         if response.intent and response.stage == "intent":

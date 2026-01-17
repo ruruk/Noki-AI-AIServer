@@ -15,6 +15,7 @@ from config import settings
 from app.services.token_usage import TokenUsageService
 from app.models.schemas import ChatInput, AIResponse, AIIntent, IntentType, Stage, TokenUsage
 from app.services.vector import VectorService
+from app.services.backend_client import BackendClient
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class LLMService:
     def __init__(self, vector_service: VectorService):
         self.vector_service = vector_service
         self.token_service = TokenUsageService()
+        self.backend_client = BackendClient()
         
         # Initialize OpenAI model
         self.llm = ChatOpenAI(
@@ -51,32 +53,52 @@ class LLMService:
         self.system_prompt = """You are Noki AI, an intelligent academic assistant designed to help students with their coursework, assignments, and study planning.
 
 Your capabilities:
-- Analyze academic content and provide explanations
+- Analyze academic content and provide detailed explanations
 - Create study schedules and task lists
-- Answer questions about course materials
+- Answer questions about course materials with depth and insight
 - Help with project planning and time management
 - Provide tutoring and learning support
+- Analyze workload and provide prioritization recommendations
+- Give detailed insights about projects, tasks, and deadlines
 
 Guidelines:
-- Always provide structured, actionable responses
-- Use the provided context (projects, tasks, resources) to give relevant advice
-- When you need more information from the backend, emit an intent
+- Always provide structured, actionable, and DETAILED responses
+- Use the provided context (projects, tasks, todos, resources) to give comprehensive advice
+- When analyzing data, provide insights, patterns, and recommendations
 - Format responses as structured blocks for the UI
-- Be concise but comprehensive
+- Be thorough but organized - break down complex information
 - Focus on academic productivity and learning
 - ALWAYS reference conversation history when relevant
-- If user asks about assignments/tasks/schedule and you have context data, use it
-- If user asks for "all" or comprehensive data, acknowledge existing context but request fresh data
+- If user asks about assignments/tasks/schedule and you have context data, provide DETAILED analysis
+- Analyze due dates, priorities, and workload distribution
+- Provide actionable recommendations based on the data
 
 Conversation Context:
 - User ID: {user_id}
 - Conversation ID: {conversation_id}
 - Available projects: {projects}
 - Available tasks: {tasks}
+- Available todos: {todos}
 - Relevant resources: {resources}
 - Recent conversation history: {conversation_history}
 
-IMPORTANT: When referencing conversation history, acknowledge what was discussed earlier and build upon it. If the user asks for comprehensive data (like "all my assignments"), acknowledge any existing context but explain that you're getting the most current information."""
+ANALYSIS REQUIREMENTS:
+- When given projects/tasks/todos, analyze:
+  * Due date patterns and urgency
+  * Priority distribution
+  * Workload balance
+  * Potential conflicts or overlaps
+  * Recommendations for scheduling
+  * Progress tracking insights
+
+- Provide detailed breakdowns:
+  * Group items by project, priority, or due date
+  * Highlight critical deadlines
+  * Suggest optimal work order
+  * Identify potential issues or concerns
+  * Offer specific, actionable advice
+
+IMPORTANT: When referencing conversation history, acknowledge what was discussed earlier and build upon it. Provide comprehensive, detailed analysis that helps students make informed decisions."""
 
         # Planner-specific prompt
         self.planner_prompt = """You are Noki AI in planning mode. Your job is to create structured study plans, schedules, and task lists.
@@ -126,11 +148,12 @@ Output format:
 - Include todo_list blocks for research tasks
 - Provide clear citations and references"""
     
-    def process_chat_request(self, chat_input: ChatInput) -> AIResponse:
+    async def process_chat_request(self, chat_input: ChatInput) -> AIResponse:
         """
         Process a chat request and return AI response
         
         This is the main entry point for chat processing
+        Enhanced to automatically fetch backend data when needed
         """
         try:
             # Step 1: Retrieve semantic context
@@ -139,22 +162,80 @@ Output format:
             # Step 2: Determine if backend data is needed
             intent = self._determine_intent(chat_input, semantic_context)
             
-            if intent:
-                # Save the user message before returning intent
-                self._save_message(chat_input)
-                
-                # Return intent response
-                return AIResponse(
-                    stage=Stage.INTENT,
-                    conversation_id=chat_input.conversation_id,
-                    text="Let me gather some information to help you better.",
-                    intent=intent
-                )
+            # Step 3: If intent detected and we have auth token, fetch data automatically
+            # Get auth token from metadata if not directly in chat_input
+            auth_token = chat_input.auth_token or (chat_input.metadata or {}).get("auth_token")
             
-            # Step 3: Generate response
-            response = self._generate_response(chat_input, semantic_context)
+            if intent and intent.type == IntentType.BACKEND_QUERY and auth_token:
+                try:
+                    logger.info(f"Fetching backend data: {intent.targets}, period: {intent.payload.get('time_period', 'all')}")
+                    
+                    # Fetch data from backend
+                    backend_data = await self.backend_client.fetch_data_for_ai(
+                        user_id=chat_input.user_id,
+                        auth_token=auth_token,
+                        data_types=intent.targets or [],
+                        time_period=intent.payload.get("time_period"),
+                        project_ids=intent.filters.get("project_ids") if intent.filters else None,
+                        include_completed=intent.payload.get("include_completed", False)
+                    )
+                    
+                    # Update chat_input with fetched data
+                    if "projects" in backend_data:
+                        from app.models.schemas import Project
+                        chat_input.projects = [
+                            Project(project_id=p.get("project_id", ""), title=p.get("title", ""), 
+                                   description=p.get("description"), instructor=p.get("instructor"))
+                            for p in backend_data["projects"]
+                        ]
+                    
+                    if "tasks" in backend_data:
+                        from app.models.schemas import Task, TaskStatus
+                        chat_input.tasks = []
+                        for t in backend_data["tasks"]:
+                            try:
+                                due_datetime = None
+                                if t.get("due_datetime"):
+                                    # Handle various datetime formats
+                                    dt_str = t["due_datetime"].replace("Z", "+00:00")
+                                    due_datetime = datetime.fromisoformat(dt_str)
+                                
+                                chat_input.tasks.append(
+                                    Task(
+                                        task_id=t.get("task_id", ""),
+                                        title=t.get("title", ""),
+                                        description=t.get("description"),
+                                        due_datetime=due_datetime,
+                                        status=TaskStatus.DONE if t.get("status") == "done" else TaskStatus.NOT_STARTED,
+                                        project_id=t.get("project_id")
+                                    )
+                                )
+                            except Exception as e:
+                                logger.warn(f"Error parsing task {t.get('task_id')}: {e}")
+                                # Add task without due_datetime if parsing fails
+                                chat_input.tasks.append(
+                                    Task(
+                                        task_id=t.get("task_id", ""),
+                                        title=t.get("title", ""),
+                                        description=t.get("description"),
+                                        status=TaskStatus.NOT_STARTED,
+                                        project_id=t.get("project_id")
+                                    )
+                                )
+                    
+                    if "todos" in backend_data:
+                        chat_input.todos = backend_data["todos"]
+                    
+                    logger.info(f"Fetched {len(chat_input.projects or [])} projects, {len(chat_input.tasks or [])} tasks, {len(chat_input.todos or [])} todos")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to fetch backend data: {e}")
+                    # Continue with existing context if fetch fails
             
-            # Step 4: Save message to vector store
+            # Step 4: Generate response with enriched context
+            response = await self._generate_response(chat_input, semantic_context)
+            
+            # Step 5: Save message to vector store
             self._save_message(chat_input)
             
             return response
@@ -234,74 +315,85 @@ Output format:
             return []
     
     def _determine_intent(self, chat_input: ChatInput, context: List[Document]) -> Optional[AIIntent]:
-        """Determine if backend data is needed"""
+        """Determine if backend data is needed - Enhanced with time period detection"""
         try:
             prompt_lower = chat_input.prompt.lower()
             
-            # Check what context data we already have
-            has_assignments_context = any(
-                "assignments" in doc.metadata.get("context_data_keys", []) or
-                "assignment" in doc.page_content.lower()
-                for doc in context
-            )
+            # Check if we already have sufficient context data
+            has_projects = len(chat_input.projects or []) > 0
+            has_tasks = len(chat_input.tasks or []) > 0
+            has_todos = len(chat_input.todos or []) > 0
             
-            has_schedule_context = any(
-                "schedule" in doc.metadata.get("context_data_keys", []) or
-                "schedule" in doc.page_content.lower()
-                for doc in context
-            )
+            # Time period keywords
+            time_keywords = {
+                "today": ["today", "this day"],
+                "this_week": ["this week", "this week's", "week", "weekly", "upcoming week"],
+                "this_month": ["this month", "monthly", "this month's"],
+                "next_two_months": ["next month", "next two months", "upcoming months"],
+                "overdue": ["overdue", "past due", "late", "missed", "expired"],
+            }
             
-            # Keywords that suggest user wants comprehensive/updated data
+            # Detect time period
+            detected_period = None
+            for period, keywords in time_keywords.items():
+                if any(keyword in prompt_lower for keyword in keywords):
+                    detected_period = period
+                    break
+            
+            # Entity keywords
+            project_keywords = ["project", "projects", "course", "courses", "class", "classes"]
+            task_keywords = ["task", "tasks", "assignment", "assignments", "homework", "deadline", "deadlines"]
+            todo_keywords = ["todo", "todos", "to-do", "to-dos", "item", "items", "checklist"]
+            
+            # Comprehensive keywords
             comprehensive_keywords = [
                 "all my", "show me all", "list all", "give me all", "what are all",
-                "complete list", "full list", "everything", "entire", "comprehensive"
+                "what are my", "complete list", "full list", "everything", "entire", "comprehensive"
             ]
             
-            # Keywords that suggest user wants specific data types
-            assignment_keywords = [
-                "assignments", "homework", "due dates", "upcoming", "deadlines", 
-                "projects", "tasks", "papers", "essays", "exams"
-            ]
-            
-            schedule_keywords = [
-                "schedule", "calendar", "time", "when", "appointments", "meetings",
-                "classes", "events", "availability"
-            ]
-            
-            # Check if user is asking for comprehensive data
+            # Determine what user wants
+            wants_projects = any(keyword in prompt_lower for keyword in project_keywords)
+            wants_tasks = any(keyword in prompt_lower for keyword in task_keywords)
+            wants_todos = any(keyword in prompt_lower for keyword in todo_keywords)
             wants_comprehensive = any(keyword in prompt_lower for keyword in comprehensive_keywords)
             
-            # Check if user is asking for specific data types
-            wants_assignments = any(keyword in prompt_lower for keyword in assignment_keywords)
-            wants_schedule = any(keyword in prompt_lower for keyword in schedule_keywords)
+            # If no specific entity mentioned, assume tasks/todos (most common)
+            if not wants_projects and not wants_tasks and not wants_todos:
+                wants_tasks = True
+                wants_todos = True
             
-            # Determine if we need to request fresh data
-            needs_assignments = wants_assignments and (
-                not has_assignments_context or  # No existing context
-                wants_comprehensive or  # User wants comprehensive data
-                "updated" in prompt_lower or "latest" in prompt_lower or "current" in prompt_lower
-            )
+            # Determine if we need to fetch data
+            needs_projects = wants_projects and (not has_projects or wants_comprehensive or detected_period)
+            needs_tasks = wants_tasks and (not has_tasks or wants_comprehensive or detected_period)
+            needs_todos = wants_todos and (not has_todos or wants_comprehensive or detected_period)
             
-            needs_schedule = wants_schedule and (
-                not has_schedule_context or  # No existing context
-                wants_comprehensive or  # User wants comprehensive data
-                "updated" in prompt_lower or "latest" in prompt_lower or "current" in prompt_lower
-            )
+            # Get auth token from metadata if not directly in chat_input
+            auth_token = chat_input.auth_token or (chat_input.metadata or {}).get("auth_token")
             
-            if needs_assignments or needs_schedule:
+            # If we need any data and have auth token, return intent
+            if (needs_projects or needs_tasks or needs_todos) and auth_token:
                 targets = []
-                if needs_assignments:
-                    targets.append("assignments")
-                if needs_schedule:
-                    targets.append("schedule")
+                if needs_projects:
+                    targets.append("projects")
+                if needs_tasks:
+                    targets.append("tasks")
+                if needs_todos:
+                    targets.append("todos")
+                
+                filters = {}
+                if chat_input.projects:
+                    filters["project_ids"] = [p.project_id for p in chat_input.projects]
+                
+                payload = {
+                    "time_period": detected_period or "all",
+                    "include_completed": False
+                }
                 
                 return AIIntent(
                     type=IntentType.BACKEND_QUERY,
                     targets=targets,
-                    filters={
-                        "project_ids": [p.project_id for p in (chat_input.projects or [])],
-                        "task_ids": [t.task_id for t in (chat_input.tasks or [])]
-                    }
+                    filters=filters,
+                    payload=payload
                 )
             
             return None
@@ -310,14 +402,17 @@ Output format:
             logger.error(f"Failed to determine intent: {e}")
             return None
     
-    def _generate_response(self, chat_input: ChatInput, context: List[Document]) -> AIResponse:
+    async def _generate_response(self, chat_input: ChatInput, context: List[Document]) -> AIResponse:
         """Generate AI response with structured blocks"""
         try:
             # Format context for prompt
             context_text = self._format_context(context)
             projects_text = self._format_projects(chat_input.projects or [])
             tasks_text = self._format_tasks(chat_input.tasks or [])
-            conversation_history = self._format_conversation_history(context)
+            todos_text = self._format_todos(chat_input.todos or [])
+            conversation_history = self._format_conversation_history(
+                chat_input.conversation_history or []
+            )
             
             # Create system message
             system_message = SystemMessage(content=self.system_prompt.format(
@@ -325,6 +420,7 @@ Output format:
                 conversation_id=chat_input.conversation_id,
                 projects=projects_text,
                 tasks=tasks_text,
+                todos=todos_text,
                 resources=context_text,
                 conversation_history=conversation_history
             ))

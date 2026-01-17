@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     embedding_cache_ttl: int = 3600  # Cache embeddings for 1 hour
     max_concurrent_embeddings: int = 5  # Limit concurrent embedding operations
     
+    # Backend API Configuration
+    backend_url: Optional[str] = os.getenv("BACKEND_URL", "http://localhost:3000")
+    
     # Security
     secret_key: str = "your-secret-key-change-this-in-production"
     algorithm: str = "HS256"
